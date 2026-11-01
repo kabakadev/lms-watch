@@ -9,7 +9,7 @@ function Notice({ onAccept }) {
       <div className="w-full max-w-lg bg-white rounded-2xl shadow-sm p-8 space-y-4">
         <h1 className="text-2xl font-bold text-slate-900">Private project: read before continuing</h1>
         <p className="text-sm font-semibold text-slate-700">
-          You must click “Accept and continue to sign in” to dismiss this notice. No futher notices will be issues, proceed at your own risk!!!!.
+          You must click “Accept and continue to sign in” to dismiss this notice. No futher notices will be issued, proceed at your own risk!!!!.
         </p>
 
         <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-slate-800 space-y-3">
@@ -30,10 +30,7 @@ function Notice({ onAccept }) {
             If you stop trusting this app, sign out here and change your eLearning password, which should
             invalidate the token. To have your invite removed, tell whoever sent you this link.
           </p>
-          <p>
-            Zetech may have rules about third-party access to its systems. You use this at your own risk, and
-            availability is not guaranteed.
-          </p>
+
           <p>Do not use it on a shared or public computer.</p>
         </div>
 
