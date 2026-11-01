@@ -1,43 +1,116 @@
-from fastapi import Form
-from fastapi import Form
+"""Moodle client API: course content, deadlines and submissions.
+
+Runs two ways:
+  * Web app (LMS_WEB=1): every /api request needs a session cookie. The Moodle
+    token lives only inside that encrypted cookie; the server stores none.
+  * Scripts (reminders.py, watcher.py): no session; the token comes from the
+    MOODLE_TOKEN environment variable.
+"""
 import asyncio
+import hashlib
+import os
 import re
 import time
-import os
+from collections import deque
+from contextvars import ContextVar
 from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from cryptography.fernet import Fernet, InvalidToken
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173","http://localhost:5174"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 MOODLE_BASE = "https://elearning.zetech.ac.ke"
 MOODLE_URL = f"{MOODLE_BASE}/webservice/rest/server.php"
-USER_TOKEN = os.environ["MOODLE_TOKEN"]  # set in the environment; never write a token in this file
-API_PUBLIC = "http://localhost:8000"
+
+WEB_MODE = os.environ.get("LMS_WEB") == "1"
+ENV_TOKEN = os.environ.get("MOODLE_TOKEN")  # scripts only; ignored in web mode
+COOKIE_NAME = "lms_session"
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"
+SESSION_DAYS = 30
+PUBLIC_PATHS = {"/api/login", "/api/logout", "/api/health"}
+
+_key = os.environ.get("SESSION_KEY")
+fernet = Fernet(_key) if _key else None
+if WEB_MODE and not fernet:
+    raise RuntimeError("LMS_WEB=1 requires SESSION_KEY")
 
 # IDs to filter out (Notices, Timetables, Surveys)
 JUNK_IDS = {53703, 59384, 35708, 28, 627, 644, 12672, 13128, 35283, 20, 13}
 
 
+# --------------------------------------------------------------------------
+# Session handling
+# --------------------------------------------------------------------------
+_session_token: ContextVar = ContextVar("session_token", default=None)
+
+
+def current_token() -> str:
+    tok = _session_token.get()
+    if not tok and not WEB_MODE:
+        tok = ENV_TOKEN  # never used in web mode
+    if not tok:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    return tok
+
+
+def read_session(request: Request):
+    raw = request.cookies.get(COOKIE_NAME)
+    if not raw or not fernet:
+        return None
+    try:
+        return fernet.decrypt(raw.encode(), ttl=SESSION_DAYS * 86400).decode()
+    except InvalidToken:
+        return None
+
+
+async def require_session(request: Request):
+    # async on purpose: the ContextVar must be set inside the request's own task
+    path = request.url.path
+    if path in PUBLIC_PATHS or not path.startswith("/api/"):
+        return
+    token = read_session(request)
+    if WEB_MODE and not token:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    _session_token.set(token)
+
+
+app = FastAPI(
+    dependencies=[Depends(require_session)],
+    docs_url=None if WEB_MODE else "/docs",
+    redoc_url=None,
+    openapi_url=None if WEB_MODE else "/openapi.json",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --------------------------------------------------------------------------
+# Moodle helpers
+# --------------------------------------------------------------------------
+def course_code(fullname: str) -> str:
+    m = re.match(r"^([A-Z]{3}\s?\d{3})", fullname)
+    return m.group(1) if m else fullname[:12]
+
+
+def clean_event_name(name: str) -> str:
+    return re.sub(r"\s+(is due|should be completed|closes|opens)$", "", name, flags=re.I)
+
+
 def proxied(url: str) -> str:
-    """Route file downloads through this backend so the token never reaches the browser."""
-    return f"{API_PUBLIC}/api/file?url={quote(url, safe='')}"
+    """Route file downloads through this server so the token never reaches the page."""
+    return f"/api/file?url={quote(url, safe='')}"
 
 
-async def moodle(fn: str, params: dict | None = None):
+async def moodle(fn: str, params: dict | None = None, token: str | None = None):
     payload = {
-        "wstoken": USER_TOKEN,
+        "wstoken": token or current_token(),
         "wsfunction": fn,
         "moodlewsrestformat": "json",
         **(params or {}),
@@ -48,10 +121,75 @@ async def moodle(fn: str, params: dict | None = None):
         raise HTTPException(status_code=502, detail="Failed to reach LMS")
     data = r.json()
     if isinstance(data, dict) and "exception" in data:
-        raise HTTPException(status_code=403, detail=data.get("message", data["exception"]))
+        status = 401 if data.get("errorcode") == "invalidtoken" else 403
+        raise HTTPException(status_code=status, detail=data.get("message", data["exception"]))
     return data
 
 
+# --------------------------------------------------------------------------
+# Auth endpoints
+# --------------------------------------------------------------------------
+_attempts: deque = deque(maxlen=50)
+
+
+@app.get("/api/health")
+async def health():
+    return {"ok": True}
+
+
+@app.post("/api/login")
+async def login(response: Response, username: str = Form(...), password: str = Form(...)):
+    if not fernet:
+        raise HTTPException(status_code=503, detail="Sessions are not configured")
+
+    now = time.time()
+    while _attempts and now - _attempts[0] > 300:
+        _attempts.popleft()
+    if len(_attempts) >= 10:
+        raise HTTPException(status_code=429, detail="Too many attempts. Try again in a few minutes.")
+    _attempts.append(now)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"{MOODLE_BASE}/login/token.php",
+            data={"username": username.strip(), "password": password, "service": "moodle_mobile_app"},
+        )
+    try:
+        data = r.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Unexpected reply from the LMS")
+    token = data.get("token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Login failed. Check your username and password.")
+
+    info = await moodle("core_webservice_get_site_info", token=token)
+    response.set_cookie(
+        COOKIE_NAME,
+        fernet.encrypt(token.encode()).decode(),
+        max_age=SESSION_DAYS * 86400,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="strict",
+        path="/",
+    )
+    return {"ok": True, "fullname": info.get("fullname")}
+
+
+@app.post("/api/logout")
+async def logout(response: Response):
+    response.delete_cookie(COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/me")
+async def me():
+    info = await moodle("core_webservice_get_site_info")
+    return {"fullname": info.get("fullname")}
+
+
+# --------------------------------------------------------------------------
+# Courses, content, files
+# --------------------------------------------------------------------------
 @app.get("/api/my-courses")
 async def get_my_courses():
     data = await moodle(
@@ -77,10 +215,10 @@ async def get_course_content(course_id: int):
 
 @app.get("/api/file")
 async def proxy_file(url: str):
-    # Only ever fetch from Moodle itself
-    if not url.startswith(MOODLE_BASE + "/"):
+    # Only Moodle's own file endpoint, nothing else
+    if not url.startswith(MOODLE_BASE + "/webservice/pluginfile.php/"):
         raise HTTPException(status_code=400, detail="Bad URL")
-    target = httpx.URL(url).copy_merge_params({"token": USER_TOKEN})
+    target = httpx.URL(url).copy_merge_params({"token": current_token()})
     client = httpx.AsyncClient(timeout=None)
     r = await client.send(client.build_request("GET", target), stream=True)
 
@@ -100,14 +238,28 @@ async def proxy_file(url: str):
     return StreamingResponse(gen(), headers=headers, status_code=r.status_code)
 
 
-@app.get("/api/assignment/{course_id}/{cmid}")
-async def get_assignment(course_id: int, cmid: int):
+# --------------------------------------------------------------------------
+# Assignments and submissions
+# --------------------------------------------------------------------------
+async def find_assignment(course_id: int, cmid: int):
     data = await moodle("mod_assign_get_assignments", {"courseids[0]": course_id})
     assigns = data["courses"][0]["assignments"] if data.get("courses") else []
     a = next((x for x in assigns if x["cmid"] == cmid), None)
     if not a:
         raise HTTPException(status_code=404, detail="Assignment not found")
+    return a
 
+
+def file_config(a: dict, name: str, default):
+    for c in a.get("configs", []):
+        if c["plugin"] == "file" and c["name"] == name:
+            return c["value"]
+    return default
+
+
+@app.get("/api/assignment/{course_id}/{cmid}")
+async def get_assignment(course_id: int, cmid: int):
+    a = await find_assignment(course_id, cmid)
     status = await moodle("mod_assign_get_submission_status", {"assignid": a["id"]})
 
     for f in a.get("introattachments", []):
@@ -121,24 +273,122 @@ async def get_assignment(course_id: int, cmid: int):
     return {"assignment": a, "status": status}
 
 
+@app.post("/api/assignment/{course_id}/{cmid}/files")
+async def submit_files(
+    course_id: int,
+    cmid: int,
+    files: list[UploadFile] = File(...),
+    dry_run: bool = Form(False),
+):
+    a = await find_assignment(course_id, cmid)
+    status = await moodle("mod_assign_get_submission_status", {"assignid": a["id"]})
+    sub = (status.get("lastattempt") or {}).get("submission") or {}
 
-_cache = {"at": 0, "data": None}
+    existing = [
+        f
+        for p in sub.get("plugins", []) if p.get("type") == "file"
+        for area in p.get("fileareas", [])
+        for f in area.get("files", [])
+    ]
+    new = {f.filename: f for f in files}
+    old_names = {f["filename"] for f in existing}
+    keep = [f for f in existing if f["filename"] not in new]
+    plan = {
+        "keep": [f["filename"] for f in keep],
+        "replace": [n for n in new if n in old_names],
+        "add": [n for n in new if n not in old_names],
+    }
+    plan["total"] = len(keep) + len(new)
+    plan["max"] = int(file_config(a, "maxfilesubmissions", 1))
+    if plan["total"] > plan["max"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{plan['total']} files would be submitted but the limit is {plan['max']}",
+        )
+
+    # Saving replaces the whole file area, so re-fetch what must be kept and
+    # stop before writing anything if any of it cannot be verified.
+    token = current_token()
+    uploads = []
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+        for f in keep:
+            url = httpx.URL(f["fileurl"]).copy_merge_params({"token": token})
+            r = await client.get(url)
+            if r.status_code != 200 or len(r.content) != f.get("filesize"):
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Could not verify existing file '{f['filename']}'; nothing was changed",
+                )
+            uploads.append((f["filename"], r.content))
+
+        if dry_run:
+            return {"ok": True, "dry_run": True, **plan}
+
+        for f in files:
+            uploads.append((f.filename, await f.read()))
+
+        up = await client.post(
+            f"{MOODLE_BASE}/webservice/upload.php",
+            data={"token": token, "filearea": "draft", "itemid": 0},
+            files={f"file_{i + 1}": (n, c) for i, (n, c) in enumerate(uploads)},
+        )
+
+    items = up.json()
+    if isinstance(items, dict) and "error" in items:
+        raise HTTPException(status_code=400, detail=items["error"])
+    itemid = items[0]["itemid"]
+
+    warnings = await moodle(
+        "mod_assign_save_submission",
+        {"assignmentid": a["id"], "plugindata[files_filemanager]": itemid},
+    )
+    if warnings:
+        raise HTTPException(status_code=400, detail=warnings[0].get("message", "Moodle rejected the save"))
+
+    # Only assignments that make students click "submit" need this extra step
+    if str(a.get("submissiondrafts")) == "1":
+        w = await moodle(
+            "mod_assign_submit_for_grading",
+            {"assignmentid": a["id"], "acceptsubmissionstatement": 1},
+        )
+        if w:
+            raise HTTPException(status_code=400, detail=w[0].get("message", "Could not submit for grading"))
+
+    _cache.pop(cache_key(), None)  # fresh statuses on the dashboard
+    return {"ok": True, "dry_run": False, **plan}
 
 
-def course_code(fullname: str) -> str:
-    m = re.match(r"^([A-Z]{3}\s?\d{3})", fullname)
-    return m.group(1) if m else fullname[:12]
+# --------------------------------------------------------------------------
+# Deadlines (cached per user)
+# --------------------------------------------------------------------------
+_cache: dict = {}
 
 
-def clean_event_name(name: str) -> str:
-    return re.sub(r"\s+(is due|should be completed|closes|opens)$", "", name, flags=re.I)
+def cache_key() -> str:
+    return hashlib.sha256(current_token().encode()).hexdigest()
+
+
+async def all_action_events(since: int):
+    """Page through Moodle's action events (it caps each page at 50)."""
+    events, after = [], 0
+    for _ in range(10):
+        params = {"timesortfrom": since, "limitnum": 50}
+        if after:
+            params["aftereventid"] = after
+        page = (await moodle("core_calendar_get_action_events_by_timesort", params)).get("events", [])
+        events += page
+        if len(page) < 50:
+            break
+        after = page[-1]["id"]
+    return events
 
 
 @app.get("/api/deadlines")
 async def get_deadlines(refresh: bool = False):
-    # 2-minute cache so reloading the page doesn't hammer Moodle
-    if not refresh and _cache["data"] and time.time() - _cache["at"] < 120:
-        return _cache["data"]
+    key = cache_key()
+    hit = _cache.get(key)
+    if not refresh and hit and time.time() - hit[0] < 120:
+        return hit[1]
 
     raw = await moodle(
         "core_course_get_enrolled_courses_by_timeline_classification",
@@ -183,15 +433,11 @@ async def get_deadlines(refresh: bool = False):
             "graded": graded,
         })
 
-    # 2) Everything else Moodle says needs action (forums, quizzes, ...)
+    # 2) Everything else Moodle says needs action (quizzes, ...); forums are skipped
     try:
-        cal = await moodle("core_calendar_get_action_events_by_timesort", {
-            "timesortfrom": int(time.time()) - 30 * 86400,
-            "limitnum": 50,
-        })
-        for e in cal.get("events", []):
+        for e in await all_action_events(int(time.time()) - 30 * 86400):
             if e.get("modulename") in ("assign", "forum"):
-                continue  # covered above, with real submission status
+                continue  # assignments are covered above with real status
             course = e.get("course") or {}
             if course.get("id") not in by_id:
                 continue  # skips notices/timetable courses
@@ -215,105 +461,7 @@ async def get_deadlines(refresh: bool = False):
     out.sort(key=lambda x: (x["duedate"] == 0, x["duedate"]))
 
     result = {"items": out}
-    _cache.update(at=time.time(), data=result)
+    _cache[key] = (time.time(), result)
+    if len(_cache) > 50:
+        _cache.pop(min(_cache, key=lambda k: _cache[k][0]))
     return result
-
-
-async def find_assignment(course_id: int, cmid: int):
-    data = await moodle("mod_assign_get_assignments", {"courseids[0]": course_id})
-    assigns = data["courses"][0]["assignments"] if data.get("courses") else []
-    a = next((x for x in assigns if x["cmid"] == cmid), None)
-    if not a:
-        raise HTTPException(status_code=404, detail="Assignment not found")
-    return a
-
-
-def file_config(a: dict, name: str, default):
-    for c in a.get("configs", []):
-        if c["plugin"] == "file" and c["name"] == name:
-            return c["value"]
-    return default
-
-
-@app.post("/api/assignment/{course_id}/{cmid}/files")
-async def submit_files(
-    course_id: int,
-    cmid: int,
-    files: list[UploadFile] = File(...),
-    dry_run: bool = Form(False),
-):
-    a = await find_assignment(course_id, cmid)
-    status = await moodle("mod_assign_get_submission_status", {"assignid": a["id"]})
-    sub = (status.get("lastattempt") or {}).get("submission") or {}
-
-    existing = [
-        f
-        for p in sub.get("plugins", []) if p.get("type") == "file"
-        for area in p.get("fileareas", [])
-        for f in area.get("files", [])
-    ]
-    new = {f.filename: f for f in files}
-    old_names = {f["filename"] for f in existing}
-    keep = [f for f in existing if f["filename"] not in new]
-    plan = {
-        "keep": [f["filename"] for f in keep],
-        "replace": [n for n in new if n in old_names],
-        "add": [n for n in new if n not in old_names],
-    }
-    plan["total"] = len(keep) + len(new)
-    plan["max"] = int(file_config(a, "maxfilesubmissions", 1))
-    if plan["total"] > plan["max"]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{plan['total']} files would be submitted but the limit is {plan['max']}",
-        )
-
-    # Re-fetch the files that must be kept. Saving replaces the whole file area,
-    # so if any of them cannot be verified we stop before writing anything.
-    uploads = []
-    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-        for f in keep:
-            url = httpx.URL(f["fileurl"]).copy_merge_params({"token": USER_TOKEN})
-            r = await client.get(url)
-            if r.status_code != 200 or len(r.content) != f.get("filesize"):
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Could not verify existing file '{f['filename']}'; nothing was changed",
-                )
-            uploads.append((f["filename"], r.content))
-
-        if dry_run:
-            return {"ok": True, "dry_run": True, **plan}
-
-        for f in files:
-            uploads.append((f.filename, await f.read()))
-
-        up = await client.post(
-            f"{MOODLE_BASE}/webservice/upload.php",
-            data={"token": USER_TOKEN, "filearea": "draft", "itemid": 0},
-            files={f"file_{i + 1}": (n, c) for i, (n, c) in enumerate(uploads)},
-        )
-
-    items = up.json()
-    if isinstance(items, dict) and "error" in items:
-        raise HTTPException(status_code=400, detail=items["error"])
-    itemid = items[0]["itemid"]
-
-    warnings = await moodle(
-        "mod_assign_save_submission",
-        {"assignmentid": a["id"], "plugindata[files_filemanager]": itemid},
-    )
-    if warnings:
-        raise HTTPException(status_code=400, detail=warnings[0].get("message", "Moodle rejected the save"))
-
-    # Only assignments with "require students to click submit" need this extra step
-    if str(a.get("submissiondrafts")) == "1":
-        w = await moodle(
-            "mod_assign_submit_for_grading",
-            {"assignmentid": a["id"], "acceptsubmissionstatement": 1},
-        )
-        if w:
-            raise HTTPException(status_code=400, detail=w[0].get("message", "Could not submit for grading"))
-
-    _cache["at"] = 0  # force fresh statuses on the dashboard
-    return {"ok": True, "dry_run": False, **plan}
