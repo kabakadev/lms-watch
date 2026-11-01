@@ -19,7 +19,7 @@ function countdown(due, now) {
 
 // "BSD 221 BCS YR1S2 Assembly Language Programming (Sep - Dec 2026)" -> "Assembly Language Programming"
 function cleanName(full) {
-  let n = full.replace(/\(.*?\)/g, '').trim();
+  const n = full.replace(/\(.*?\)/g, '').trim();
   const parts = n.split(/YR\dS\d,?\s*/);
   if (parts.length > 1) return parts[parts.length - 1].trim();
   return n.replace(/^[A-Z]{3}\s?\d{3}\s*/, '').trim();
@@ -28,7 +28,7 @@ function cleanName(full) {
 function Row({ item, now, onOpen }) {
   const done = item.status === 'submitted';
   const cd = item.duedate ? countdown(item.duedate, now) : null;
-  let chip = ['bg-slate-100 text-slate-600', 'Not submitted'];
+  let chip = ['bg-slate-100 text-slate-600', item.kind === 'assign' ? 'Not submitted' : 'To do'];
   if (done) chip = ['bg-emerald-100 text-emerald-700', item.graded ? 'Graded' : 'Submitted'];
   else if (cd?.overdue) chip = ['bg-red-100 text-red-700', 'Overdue'];
   else if (cd?.urgent) chip = ['bg-amber-100 text-amber-800', 'Due soon'];
@@ -36,25 +36,28 @@ function Row({ item, now, onOpen }) {
   return (
     <button
       onClick={() => onOpen(item.course_id, item.cmid)}
-      className="w-full flex items-center gap-4 px-5 py-4 text-left bg-white hover:bg-slate-50 border-b border-slate-100 last:border-0"
+      className="w-full border-b border-slate-100 bg-white px-4 py-3 text-left last:border-0 hover:bg-slate-50 sm:px-5 sm:py-4"
     >
-      <span className="w-20 shrink-0 text-xs font-bold text-slate-500" title={item.course_name}>
-        {item.course_code}
+      <span className="flex items-center justify-between gap-3">
+        <span className="text-xs font-bold text-slate-500" title={item.course_name}>{item.course_code}</span>
+        <span className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${chip[0]}`}>{chip[1]}</span>
       </span>
-      <span className="flex-1 min-w-0">
-        <span className="block font-semibold text-slate-800 truncate">{item.name}</span>
-        {item.duedate > 0 && (
-          <span className="block text-sm text-slate-500">
-            {fmtDue(item.duedate)}{!done && cd && ` · ${cd.label}`}
-          </span>
+      <span className="mt-1 block break-words font-semibold text-slate-800">
+        {item.kind !== 'assign' && (
+          <span className="mr-2 text-xs font-bold uppercase text-slate-400">{item.kind}</span>
         )}
+        {item.name}
       </span>
-      <span className={`shrink-0 text-xs font-semibold px-3 py-1 rounded-full ${chip[0]}`}>{chip[1]}</span>
+      {item.duedate > 0 && (
+        <span className="mt-0.5 block text-sm text-slate-500">
+          {fmtDue(item.duedate)}{!done && cd && ` · ${cd.label}`}
+        </span>
+      )}
     </button>
   );
 }
 
-export default function Dashboard({ onOpen }) {
+export default function Dashboard({ onOpen, onLogout }) {
   const [items, setItems] = useState(null);
   const [courses, setCourses] = useState([]);
   const [error, setError] = useState(null);
@@ -90,54 +93,57 @@ export default function Dashboard({ onOpen }) {
 
   return (
     <div className="min-h-screen bg-slate-100">
-      <header className="bg-[#0b1f4b] text-white px-8 h-16 flex items-center justify-between">
-        <span className="font-semibold tracking-wide">ZETECH · Headless LMS</span>
-        <button onClick={() => load(true)} className="text-sm hover:underline">↻ Refresh</button>
+      <header className="flex h-14 items-center justify-between gap-3 bg-[#0b1f4b] px-4 text-white sm:h-16 sm:px-8">
+        <span className="min-w-0 truncate font-semibold tracking-wide">ZETECH · LMS</span>
+        <div className="flex shrink-0 items-center gap-4 text-sm">
+          <button onClick={() => load(true)} className="hover:underline">↻ Refresh</button>
+          <button onClick={onLogout} className="hover:underline">Sign out</button>
+        </div>
       </header>
 
-      <main className="max-w-5xl mx-auto p-8 space-y-10">
+      <main className="mx-auto max-w-5xl space-y-8 p-4 sm:space-y-10 sm:p-8">
         <section>
-          <h2 className="text-lg font-bold text-slate-900 mb-3">
-            Due soon <span className="text-slate-400 font-normal">({upcoming.length})</span>
+          <h2 className="mb-3 text-lg font-bold text-slate-900">
+            Due soon <span className="font-normal text-slate-400">({upcoming.length})</span>
           </h2>
-          <div className="rounded-xl overflow-hidden border border-slate-200">
+          <div className="overflow-hidden rounded-xl border border-slate-200">
             {upcoming.length
-              ? upcoming.map((i) => <Row key={i.assignid} item={i} now={now} onOpen={onOpen} />)
+              ? upcoming.map((i) => <Row key={i.key} item={i} now={now} onOpen={onOpen} />)
               : <p className="bg-white p-5 text-slate-500">Nothing pending. 🎉</p>}
           </div>
         </section>
 
         {overdue.length > 0 && (
           <details>
-            <summary className="cursor-pointer text-lg font-bold text-slate-900 mb-3">
-              Overdue, not submitted <span className="text-slate-400 font-normal">({overdue.length})</span>
+            <summary className="cursor-pointer text-lg font-bold text-slate-900">
+              Overdue, not submitted <span className="font-normal text-slate-400">({overdue.length})</span>
             </summary>
-            <div className="rounded-xl overflow-hidden border border-slate-200 mt-3">
-              {overdue.map((i) => <Row key={i.assignid} item={i} now={now} onOpen={onOpen} />)}
+            <div className="mt-3 overflow-hidden rounded-xl border border-slate-200">
+              {overdue.map((i) => <Row key={i.key} item={i} now={now} onOpen={onOpen} />)}
             </div>
           </details>
         )}
 
         <details>
           <summary className="cursor-pointer text-lg font-bold text-slate-900">
-            Submitted <span className="text-slate-400 font-normal">({submitted.length})</span>
+            Submitted <span className="font-normal text-slate-400">({submitted.length})</span>
           </summary>
-          <div className="rounded-xl overflow-hidden border border-slate-200 mt-3">
-            {submitted.map((i) => <Row key={i.assignid} item={i} now={now} onOpen={onOpen} />)}
+          <div className="mt-3 overflow-hidden rounded-xl border border-slate-200">
+            {submitted.map((i) => <Row key={i.key} item={i} now={now} onOpen={onOpen} />)}
           </div>
         </details>
 
         <section>
-          <h2 className="text-lg font-bold text-slate-900 mb-3">My units</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <h2 className="mb-3 text-lg font-bold text-slate-900">My units</h2>
+          <div className="grid grid-cols-1 gap-3 sm:gap-4 md:grid-cols-2">
             {courses.map((c) => (
               <button
                 key={c.id}
                 onClick={() => onOpen(c.id, null)}
-                className="text-left bg-white rounded-xl border border-slate-200 hover:border-[#0b1f4b] hover:shadow p-5 transition"
+                className="rounded-xl border border-slate-200 bg-white p-4 text-left transition hover:border-[#0b1f4b] hover:shadow sm:p-5"
               >
                 <span className="text-xs font-bold text-slate-400">{c.fullname.match(/^[A-Z]{3}\s?\d{3}/)?.[0]}</span>
-                <span className="block font-semibold text-slate-800 mt-1">{cleanName(c.fullname)}</span>
+                <span className="mt-1 block break-words font-semibold text-slate-800">{cleanName(c.fullname)}</span>
               </button>
             ))}
           </div>
