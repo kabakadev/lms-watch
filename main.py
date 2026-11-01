@@ -13,6 +13,7 @@ import re
 import time
 from collections import deque
 from contextvars import ContextVar
+from pathlib import Path
 from urllib.parse import quote
 
 import httpx
@@ -20,6 +21,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 MOODLE_BASE = "https://elearning.zetech.ac.ke"
 MOODLE_URL = f"{MOODLE_BASE}/webservice/rest/server.php"
@@ -465,3 +467,11 @@ async def get_deadlines(refresh: bool = False):
     if len(_cache) > 50:
         _cache.pop(min(_cache, key=lambda k: _cache[k][0]))
     return result
+
+
+# --------------------------------------------------------------------------
+# Frontend (present only in the Docker image, built from ./frontend)
+# --------------------------------------------------------------------------
+STATIC_DIR = Path(__file__).parent / "static"
+if STATIC_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
