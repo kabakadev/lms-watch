@@ -32,6 +32,7 @@ COOKIE_NAME = "lms_session"
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"
 SESSION_DAYS = 30
 PUBLIC_PATHS = {"/api/login", "/api/logout", "/api/health"}
+ACTIVE_USER_WINDOW = 5 * 60
 
 _key = os.environ.get("SESSION_KEY")
 fernet = Fernet(_key) if _key else None
@@ -46,6 +47,23 @@ JUNK_IDS = {53703, 59384, 35708, 28, 627, 644, 12672, 13128, 35283, 20, 13}
 # Session handling
 # --------------------------------------------------------------------------
 _session_token: ContextVar = ContextVar("session_token", default=None)
+_active_sessions: dict[str, float] = {}
+
+
+def record_active_session(request: Request) -> None:
+    """Track authenticated browser sessions in this process only."""
+    raw_cookie = request.cookies.get(COOKIE_NAME)
+    if not raw_cookie:
+        return
+
+    now = time.time()
+    cutoff = now - ACTIVE_USER_WINDOW
+    for session_id, last_seen in list(_active_sessions.items()):
+        if last_seen < cutoff:
+            del _active_sessions[session_id]
+
+    session_id = hashlib.sha256(raw_cookie.encode()).hexdigest()
+    _active_sessions[session_id] = now
 
 
 def current_token() -> str:
@@ -76,6 +94,8 @@ async def require_session(request: Request):
     if WEB_MODE and not token:
         raise HTTPException(status_code=401, detail="Not logged in")
     _session_token.set(token)
+    if WEB_MODE:
+        record_active_session(request)
 
 
 app = FastAPI(
@@ -137,6 +157,18 @@ _attempts: deque = deque(maxlen=50)
 @app.get("/api/health")
 async def health():
     return {"ok": True}
+
+
+@app.get("/api/active-users")
+async def active_users():
+    now = time.time()
+    cutoff = now - ACTIVE_USER_WINDOW
+    active = sum(last_seen >= cutoff for last_seen in _active_sessions.values())
+    return {
+        "active_users": active,
+        "window_seconds": ACTIVE_USER_WINDOW,
+        "observed_at": int(now),
+    }
 
 
 @app.post("/api/login")

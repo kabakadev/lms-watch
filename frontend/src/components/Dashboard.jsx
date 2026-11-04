@@ -60,6 +60,7 @@ function Row({ item, now, onOpen }) {
 export default function Dashboard({ onOpen, onLogout }) {
   const [items, setItems] = useState(null);
   const [courses, setCourses] = useState([]);
+  const [activeUsers, setActiveUsers] = useState(null);
   const [error, setError] = useState(null);
   const [now, setNow] = useState(Date.now());
 
@@ -77,6 +78,30 @@ export default function Dashboard({ onOpen, onLogout }) {
   };
 
   useEffect(load, []);
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadActiveUsers = () => {
+      fetch('/api/active-users')
+        .then((r) => {
+          if (!r.ok) throw new Error('Failed to load active users');
+          return r.json();
+        })
+        .then((data) => {
+          if (!cancelled) setActiveUsers(data.active_users);
+        })
+        .catch(() => {
+          if (!cancelled) setActiveUsers(null);
+        });
+    };
+
+    loadActiveUsers();
+    const interval = setInterval(loadActiveUsers, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 60_000);
     return () => clearInterval(t);
@@ -102,6 +127,12 @@ export default function Dashboard({ onOpen, onLogout }) {
       </header>
 
       <main className="mx-auto max-w-5xl space-y-8 p-4 sm:space-y-10 sm:p-8">
+        <section className="rounded-xl border border-slate-200 bg-white p-5">
+          <p className="text-sm font-semibold text-slate-500">Active users</p>
+          <p className="mt-1 text-3xl font-bold text-slate-900">{activeUsers ?? '—'}</p>
+          <p className="mt-1 text-xs text-slate-400">Signed-in sessions seen in the last 5 minutes</p>
+        </section>
+
         <section>
           <h2 className="mb-3 text-lg font-bold text-slate-900">
             Due soon <span className="font-normal text-slate-400">({upcoming.length})</span>
