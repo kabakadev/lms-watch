@@ -8,6 +8,7 @@ Runs two ways:
 """
 import asyncio
 import hashlib
+import json
 import os
 import re
 import time
@@ -33,6 +34,7 @@ COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"
 SESSION_DAYS = 30
 PUBLIC_PATHS = {"/api/login", "/api/logout", "/api/health"}
 ACTIVE_USER_WINDOW = 5 * 60
+ACTIVE_USERS_ADMIN = "bcs-03-0068/2026"
 
 _key = os.environ.get("SESSION_KEY")
 fernet = Fernet(_key) if _key else None
@@ -47,6 +49,7 @@ JUNK_IDS = {53703, 59384, 35708, 28, 627, 644, 12672, 13128, 35283, 20, 13}
 # Session handling
 # --------------------------------------------------------------------------
 _session_token: ContextVar = ContextVar("session_token", default=None)
+_session_username: ContextVar = ContextVar("session_username", default=None)
 _active_sessions: dict[str, float] = {}
 
 
@@ -80,9 +83,17 @@ def read_session(request: Request):
     if not raw or not fernet:
         return None
     try:
-        return fernet.decrypt(raw.encode(), ttl=SESSION_DAYS * 86400).decode()
+        payload = fernet.decrypt(raw.encode(), ttl=SESSION_DAYS * 86400).decode()
     except InvalidToken:
         return None
+    try:
+        session = json.loads(payload)
+    except ValueError:
+        return payload
+    if not isinstance(session, dict) or not isinstance(session.get("token"), str):
+        return None
+    _session_username.set(session.get("username"))
+    return session["token"]
 
 
 async def require_session(request: Request):
@@ -161,6 +172,9 @@ async def health():
 
 @app.get("/api/active-users")
 async def active_users():
+    if _session_username.get() != ACTIVE_USERS_ADMIN:
+        raise HTTPException(status_code=403, detail="Active-user metrics are restricted")
+
     now = time.time()
     cutoff = now - ACTIVE_USER_WINDOW
     active = sum(last_seen >= cutoff for last_seen in _active_sessions.values())
@@ -197,9 +211,13 @@ async def login(response: Response, username: str = Form(...), password: str = F
         raise HTTPException(status_code=401, detail="Login failed. Check your username and password.")
 
     info = await moodle("core_webservice_get_site_info", token=token)
+    session = json.dumps({
+        "token": token,
+        "username": info.get("username") or username.strip(),
+    })
     response.set_cookie(
         COOKIE_NAME,
-        fernet.encrypt(token.encode()).decode(),
+        fernet.encrypt(session.encode()).decode(),
         max_age=SESSION_DAYS * 86400,
         httponly=True,
         secure=COOKIE_SECURE,

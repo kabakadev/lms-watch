@@ -127,11 +127,13 @@ export default function Dashboard({ onOpen, onLogout }) {
       </header>
 
       <main className="mx-auto max-w-5xl space-y-8 p-4 sm:space-y-10 sm:p-8">
-        <section className="rounded-xl border border-slate-200 bg-white p-5">
-          <p className="text-sm font-semibold text-slate-500">Active users</p>
-          <p className="mt-1 text-3xl font-bold text-slate-900">{activeUsers ?? '—'}</p>
-          <p className="mt-1 text-xs text-slate-400">Signed-in sessions seen in the last 5 minutes</p>
-        </section>
+        {activeUsers !== null && (
+          <section className="rounded-xl border border-slate-200 bg-white p-5">
+            <p className="text-sm font-semibold text-slate-500">Active users</p>
+            <p className="mt-1 text-3xl font-bold text-slate-900">{activeUsers}</p>
+            <p className="mt-1 text-xs text-slate-400">Signed-in sessions seen in the last 5 minutes</p>
+          </section>
+        )}
 
         <section>
           <h2 className="mb-3 text-lg font-bold text-slate-900">
